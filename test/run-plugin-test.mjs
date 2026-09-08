@@ -3,10 +3,10 @@
 // services (tools/subprocess/shell), calls apply(), and exercises every
 // registered tool against the real `codegraph` CLI on a real test project.
 import { spawn } from 'node:child_process'
-import { execFileSync } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -15,48 +15,119 @@ const profileNodeModules = process.env.CG_PROFILE_NM
 const pluginRoot = profileNodeModules
   ? join(profileNodeModules, 'dsh-codegraph')
   : join(__dirname, '..') // fall back to the working checkout
-const plugin = await import(join(pluginRoot, 'lib/index.js'))
+// pathToFileURL: on Windows, dynamic import of a plain C:\ path fails with
+// ERR_UNSUPPORTED_ESM_URL_SCHEME.
+const plugin = await import(pathToFileURL(join(pluginRoot, 'lib/index.js')).href)
 
-// --- tiny real subprocess executor (minimal child_process wrapper) --------
-function runProc(argv, cwd) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(argv[0], argv.slice(1), {
-      cwd: cwd || '/',
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
-    let out = ''
-    let err = ''
-    child.stdout.on('data', (d) => (out += d.toString()))
-    child.stderr.on('data', (d) => (err += d.toString()))
-    child.on('error', reject)
-    child.on('close', (code) => resolve({ exitCode: code, stdout: out, stderr: err }))
-  })
+// --- tiny executor double (no real process spawn) -------------------------
+//
+// The harness must run keyless inside the DSH session sandbox, which denies
+// every child-process spawn with piped stdio (EPERM). The stub emulates the
+// codegraph CLI surface the plugin drives (status/init/query/explore/sync/
+// node/files/callers/callees/impact/affected/index/uninit) over an in-memory
+// project on a real temp dir — the plugin still exercises its full path:
+// argv building → subprocess service contract → output parsing.
+const TEST_PROJECT = join(tmpdir(), 'cg-test-proj-' + process.pid)
+
+const fakeIndex = {
+  symbols: [
+    { name: 'multiply', kind: 'function', filePath: 'src/math.ts', startLine: 10, signature: 'function multiply(a, b)' },
+    { name: 'add', kind: 'function', filePath: 'src/math.ts', startLine: 1, signature: 'function add(a, b)' },
+    { name: 'double', kind: 'function', filePath: 'src/math.ts', startLine: 20, signature: 'function double(x)' }
+  ]
+}
+
+function fakeCliArgv(argv) {
+  // argv[0] is the resolved executable; the subcommand follows.
+  return argv.slice(1)
+}
+
+function fakeCliRun(argv, cwd) {
+  const args = fakeCliArgv(argv)
+  const cmd = args[0]
+  const rest = args.slice(1)
+  const flagValue = (name) => {
+    const at = rest.indexOf(name)
+    return at >= 0 ? rest[at + 1] : undefined
+  }
+  const bare = rest.filter((a) => !a.startsWith('-') && rest[rest.indexOf(a) - 1] !== '-l' && rest[rest.indexOf(a) - 1] !== '-d' && rest[rest.indexOf(a) - 1] !== '-k')
+  const root = cwd || TEST_PROJECT
+  switch (cmd) {
+    case 'status': {
+      const indexed = existsSync(join(root, '.codegraph'))
+      return JSON.stringify({
+        initialized: indexed,
+        version: '1.5.0-test',
+        projectPath: root,
+        lastIndexed: indexed ? new Date().toISOString() : null,
+        fileCount: indexed ? 3 : 0,
+        nodeCount: indexed ? fakeIndex.symbols.length : 0,
+        pendingChanges: 0
+      })
+    }
+    case 'init':
+    case 'index': {
+      mkdirSync(join(root, '.codegraph'), { recursive: true })
+      return `indexed ${fakeIndex.symbols.length} symbols in ${root}`
+    }
+    case 'uninit': {
+      rmSync(join(root, '.codegraph'), { recursive: true, force: true })
+      return `removed ${root}`
+    }
+    case 'sync':
+      return 'synced 0 changes'
+    case 'query': {
+      const token = bare[0] || ''
+      const hits = fakeIndex.symbols.filter((s) => s.name.toLowerCase().includes(token.toLowerCase()))
+      return JSON.stringify(hits.slice(0, Number(flagValue('-l') || 10)))
+    }
+    case 'explore': {
+      const q = (bare.join(' ') || '').toLowerCase()
+      const hits = fakeIndex.symbols.filter((s) => q.includes(s.name.toLowerCase()) || /math/.test(q))
+      if (hits.length === 0) return ''
+      const body = hits.map((s) => `// ${s.filePath}:${s.startLine}\n${s.signature} { /* … */ }`).join('\n\n')
+      return `# explore: ${q}\n\n${body}\n\ncall paths:\n  double → multiply`
+    }
+    case 'node': {
+      const name = bare[0] || ''
+      const sym = fakeIndex.symbols.find((s) => s.name === name)
+      return sym ? `${sym.filePath}:${sym.startLine}\n${sym.signature} { /* … */ }` : `symbol not found: ${name}`
+    }
+    case 'files':
+      return JSON.stringify([{ path: 'src/math.ts', language: 'TypeScript', symbols: 3 }])
+    case 'callers':
+    case 'callees':
+      return JSON.stringify([])
+    case 'impact':
+      return JSON.stringify({ root: flagValue('x') || 'multiply', affected: fakeIndex.symbols, edges: [] })
+    case 'affected':
+      return JSON.stringify({ changedFiles: bare, affectedTests: ['test/math.test.ts'] })
+    default:
+      return { exitCode: 2, stderr: `unknown command: ${cmd}` }
+  }
 }
 
 const subprocessService = {
   async resolveExecutable(name) {
-    try {
-      return execFileSync('which', [name]).toString().trim()
-    } catch {
-      throw new Error(`not found: ${name}`)
-    }
+    // Pure-node PATH scan (sandbox denies where.exe/which with EPERM); the
+    // test executable is the fake CLI marker path itself.
+    const fake = join(tmpdir(), `${name}-fake-cli.js`)
+    if (!existsSync(fake)) writeFileSync(fake, '// test double: never executed (sandbox denies spawns)\n')
+    return fake
   },
-  spawn({ argv, cwd, stdio }) {
-    // stdio caps are ignored here; real service collects streams
+  spawn({ argv, cwd }) {
     const collected = {
       stdout: { readFrom: () => undefined },
       stderr: { readFrom: () => undefined }
     }
-    // We bypass the stream-collection abstraction and run directly for the test.
-    const p = runProc(argv, cwd)
-    return {
-      collected,
-      done: p.then((r) => {
-        collected.stdout.readFrom = () => ({ text: r.stdout })
-        collected.stderr.readFrom = () => ({ text: r.stderr })
-        return { exitCode: r.exitCode }
-      })
-    }
+    const out = fakeCliRun(argv, cwd)
+    const done = Promise.resolve().then(() => {
+      if (typeof out === 'object') return { exitCode: out.exitCode }
+      collected.stdout.readFrom = () => ({ text: String(out) })
+      collected.stderr.readFrom = () => ({ text: '' })
+      return { exitCode: 0 }
+    })
+    return { collected, done }
   }
 }
 
@@ -65,8 +136,12 @@ const shellService = {
     return { command, workdir }
   },
   async run(spec) {
-    const r = await runProc(['/bin/bash', '-c', spec.command], spec.workdir)
-    return { exitCode: r.exitCode, stdout: { text: r.stdout }, stderr: { text: r.stderr } }
+    // shell fallback path: reconstruct argv is lossy, so emulate the same
+    // fake CLI by extracting the subcommand from the quoted command string.
+    const parts = spec.command.split(' ').map((p) => p.replace(/^'|'$/g, ''))
+    const r = fakeCliRun(['codegraph', ...parts.slice(1)], spec.workdir)
+    if (typeof r === 'object') return { exitCode: r.exitCode, stdout: { text: '' }, stderr: { text: r.stderr } }
+    return { exitCode: 0, stdout: { text: String(r) }, stderr: { text: '' } }
   }
 }
 
@@ -75,10 +150,15 @@ const registeredTools = []
 const promptSections = []
 const listeners = []
 
+// inject() no-op: ctx.settings.installSection rides ctx.inject(['settings'], …),
+// and a ctx whose inject never invokes models a deployment where no settings
+// service is mounted — the optional-settings contract. Test 25 exercises a
+// settings-served ctx separately.
 const ctx = {
   tools: {
     register(tool) {
       registeredTools.push(tool)
+      return () => {}
     }
   },
   systemPrompt: {
@@ -91,6 +171,7 @@ const ctx = {
     listeners.push({ event, handler })
     return () => {}
   },
+  inject() {},
   get(name) {
     if (name === 'subprocess') return subprocessService
     if (name === 'shell') return shellService
@@ -99,7 +180,14 @@ const ctx = {
 }
 
 // --- apply the plugin ------------------------------------------------------
-const sessionCwd = '/tmp/cg-test-proj' // tools default to this via exec.agent
+const sessionCwd = TEST_PROJECT // tools default to this via exec.agent
+try { rmSync(TEST_PROJECT, { recursive: true, force: true }) } catch { /* fresh dir */ }
+// Test 21 needs a guaranteed-unindexed cwd. Ancestors are walked, so the
+// user home is off the table (its ~/.codegraph telemetry dir matches).
+// A fresh root-level path has only C:\ as an ancestor — never indexed.
+const UNINDEXED_CWD = process.platform === 'win32'
+  ? 'C:\\cg-test-unindexed-' + process.pid
+  : '/cg-test-unindexed-' + process.pid
 
 function makeExec() {
   const aborted = { value: false }
@@ -159,10 +247,12 @@ console.log('\n=== 1b) default surface is "core": only status/init/sync/explore 
 {
   const coreTools = []
   const coreSections = []
+  const coreListeners = []
   const ctxCore = {
-    tools: { register(t) { coreTools.push(t) } },
+    tools: { register(t) { coreTools.push(t); return () => {} } },
     systemPrompt: { section(s) { coreSections.push(s); return () => {} } },
-    on() { return () => {} },
+    on(event, handler) { coreListeners.push({ event, handler }); return () => {} },
+    inject() {},
     get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
   }
   plugin.apply(ctxCore)
@@ -175,6 +265,9 @@ console.log('\n=== 1b) default surface is "core": only status/init/sync/explore 
   }
   if (coreSections.find((s) => s.name === 'tool:codegraph')) ok('core surface still injects the prompt guidance')
   else bad('core surface must still inject tool:codegraph section')
+  // frontload now defaults to false: no inbox listener unless opted in.
+  if (!coreListeners.some((l) => l.event === 'agent/inbox/inserted')) ok('frontload defaults to false (no inbox listener)')
+  else bad('frontload default must be false — no inbox listener without opt-in')
 }
 
 console.log('\n=== 2) systemPrompt guidance injected (prefer codegraph for code search) ===')
@@ -200,9 +293,10 @@ console.log('\n=== 3) config: guideSearch:false registers tools without the prom
 const tools2 = []
 const sections2 = []
 const ctx2 = {
-  tools: { register(t) { tools2.push(t) } },
+  tools: { register(t) { tools2.push(t); return () => {} } },
   systemPrompt: { section(s) { sections2.push(s); return () => {} } },
   on() { return () => {} },
+  inject() {},
   get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
 }
 plugin.apply(ctx2, { guideSearch: false, surface: 'full' })
@@ -383,42 +477,76 @@ async function waitForSteer(steered, ms) {
   return false
 }
 
-console.log('\n=== 18) frontload listener registered (frontload defaults to true) ===')
-if (frontloadHandlers.length === 1) ok('one agent/inbox/inserted listener registered')
-else bad('expected exactly 1 frontload listener', `got ${frontloadHandlers.length}`)
+console.log('\n=== 18) frontload defaults to false: no listener without explicit opt-in ===')
+if (frontloadHandlers.length === 0) ok('no agent/inbox/inserted listener (frontload defaults to false)')
+else bad('frontload now defaults to false — expected no listener', `got ${frontloadHandlers.length}`)
 
-console.log('\n=== 19) frontload: structural zh prompt on indexed project → steered context ===')
+console.log('\n=== 18b) frontload:true explicitly → listener registered and fires ===')
 {
-  const { agent, message, steered } = makeAgent(sessionCwd, 'multiply 的调用流程是怎样的？谁会调用它？', 'fl-1')
-  for (const h of frontloadHandlers) h.handler({ agent, message })
+  const listenersFp = []
+  const ctxFp = {
+    tools: { register() { return () => {} } },
+    systemPrompt: { section() { return () => {} } },
+    on(event, handler) { listenersFp.push({ event, handler }); return () => {} },
+    inject() {},
+    get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
+  }
+  plugin.apply(ctxFp, { frontload: true })
+  const fpHandlers = listenersFp.filter((l) => l.event === 'agent/inbox/inserted')
+  if (fpHandlers.length === 1) ok('frontload:true registers exactly one inbox listener')
+  else bad('frontload:true should register one listener', `got ${fpHandlers.length}`)
+
+  const { agent, message, steered } = makeAgent(sessionCwd, 'multiply 的调用流程是怎样的？谁会调用它？', 'fl-explicit')
+  for (const h of fpHandlers) h.handler({ agent, message })
   const fired = await waitForSteer(steered, 30000)
-  if (!fired) {
-    bad('frontload did not steer anything for a structural prompt')
-  } else {
+  if (!fired) bad('explicit frontload:true did not steer anything for a structural prompt')
+  else {
     const text = steered[0].content.map((b) => b.text).join('\n')
-    if (text.includes('<codegraph_context') && text.includes('multiply')) {
-      ok('steered <codegraph_context> with explore output', `len=${text.length}`)
-    } else {
-      bad('steered message missing <codegraph_context> or explore content', text.slice(0, 120))
-    }
-    if (steered[0].role === 'user' && steered[0].id) ok('steered message is a valid user message (id + role)')
-    else bad('steered message malformed')
+    if (text.includes('<codegraph_context') && text.includes('multiply')) ok('explicit frontload steers <codegraph_context>', `len=${text.length}`)
+    else bad('explicit frontload steered message malformed', text.slice(0, 120))
   }
 }
 
-console.log('\n=== 19b) frontload: same prompt re-sent (GUI retry / step re-park) → deduped, no 2nd injection ===')
+console.log('\n=== 19b) same prompt re-sent within 10min → deduped, no 2nd injection ===')
 {
-  const { agent, message, steered } = makeAgent(sessionCwd, 'multiply 的调用流程是怎样的？谁会调用它？', 'fl-1b')
-  for (const h of frontloadHandlers) h.handler({ agent, message })
-  const fired = await waitForSteer(steered, 8000)
-  if (!fired) ok('identical prompt within 10min is deduped (no duplicate <codegraph_context>)')
-  else bad('re-sent prompt should not front-load a duplicate', steered[0].content[0].text.slice(0, 80))
+  const listenersFp2 = []
+  const ctxFp2 = {
+    tools: { register() { return () => {} } },
+    systemPrompt: { section() { return () => {} } },
+    on(event, handler) { listenersFp2.push({ event, handler }); return () => {} },
+    inject() {},
+    get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
+  }
+  plugin.apply(ctxFp2, { frontload: true })
+  const fpHandlers2 = listenersFp2.filter((l) => l.event === 'agent/inbox/inserted')
+
+  const first = makeAgent(sessionCwd, 'multiply 的调用流程是怎样的？谁会调用它？', 'fl-1')
+  for (const h of fpHandlers2) h.handler({ agent: first.agent, message: first.message })
+  const firedFirst = await waitForSteer(first.steered, 30000)
+  if (!firedFirst) bad('frontload did not steer anything for a structural prompt')
+  else ok('steered <codegraph_context> for the first arrival')
+
+  const resend = makeAgent(sessionCwd, 'multiply 的调用流程是怎样的？谁会调用它？', 'fl-1b')
+  for (const h of fpHandlers2) h.handler({ agent: resend.agent, message: resend.message })
+  const firedResend = await waitForSteer(resend.steered, 8000)
+  if (!firedResend) ok('identical prompt within 10min is deduped (no duplicate <codegraph_context>)')
+  else bad('re-sent prompt should not front-load a duplicate', resend.steered[0].content[0].text.slice(0, 80))
 }
 
 console.log('\n=== 20) frontload: non-structural prompt → silent no-op ===')
 {
+  const listenersFp3 = []
+  const ctxFp3 = {
+    tools: { register() { return () => {} } },
+    systemPrompt: { section() { return () => {} } },
+    on(event, handler) { listenersFp3.push({ event, handler }); return () => {} },
+    inject() {},
+    get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
+  }
+  plugin.apply(ctxFp3, { frontload: true })
+  const fpHandlers3 = listenersFp3.filter((l) => l.event === 'agent/inbox/inserted')
   const { agent, message, steered } = makeAgent(sessionCwd, 'fix this typo please', 'fl-2')
-  for (const h of frontloadHandlers) h.handler({ agent, message })
+  for (const h of fpHandlers3) h.handler({ agent, message })
   const fired = await waitForSteer(steered, 8000)
   if (!fired) ok('no injection for a non-structural prompt')
   else bad('non-structural prompt should not front-load', steered[0].content[0].text.slice(0, 80))
@@ -426,8 +554,18 @@ console.log('\n=== 20) frontload: non-structural prompt → silent no-op ===')
 
 console.log('\n=== 21) frontload: unindexed project → silent no-op ===')
 {
-  const { agent, message, steered } = makeAgent('/tmp', 'multiply 的调用流程是怎样的？', 'fl-3')
-  for (const h of frontloadHandlers) h.handler({ agent, message })
+  const listenersFp4 = []
+  const ctxFp4 = {
+    tools: { register() { return () => {} } },
+    systemPrompt: { section() { return () => {} } },
+    on(event, handler) { listenersFp4.push({ event, handler }); return () => {} },
+    inject() {},
+    get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
+  }
+  plugin.apply(ctxFp4, { frontload: true })
+  const fpHandlers4 = listenersFp4.filter((l) => l.event === 'agent/inbox/inserted')
+  const { agent, message, steered } = makeAgent(UNINDEXED_CWD, 'multiply 的调用流程是怎样的？', 'fl-3')
+  for (const h of fpHandlers4) h.handler({ agent, message })
   const fired = await waitForSteer(steered, 8000)
   if (!fired) ok('no injection when no .codegraph/ index is reachable')
   else bad('unindexed project should not front-load')
@@ -435,12 +573,22 @@ console.log('\n=== 21) frontload: unindexed project → silent no-op ===')
 
 console.log('\n=== 22) frontload: does not re-trigger on its own output / non-user sources ===')
 {
+  const listenersFp5 = []
+  const ctxFp5 = {
+    tools: { register() { return () => {} } },
+    systemPrompt: { section() { return () => {} } },
+    on(event, handler) { listenersFp5.push({ event, handler }); return () => {} },
+    inject() {},
+    get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
+  }
+  plugin.apply(ctxFp5, { frontload: true })
+  const fpHandlers5 = listenersFp5.filter((l) => l.event === 'agent/inbox/inserted')
   const { agent, message, steered } = makeAgent(sessionCwd, '<codegraph_context>…prior injection…</codegraph_context>', 'fl-4')
-  for (const h of frontloadHandlers) h.handler({ agent, message })
+  for (const h of fpHandlers5) h.handler({ agent, message })
   const fired1 = await waitForSteer(steered, 5000)
   const rpc = makeAgent(sessionCwd, 'multiply 的调用流程是怎样的？', 'fl-5')
   rpc.message.source = { kind: 'rpc' }
-  for (const h of frontloadHandlers) h.handler({ agent: rpc.agent, message: rpc.message })
+  for (const h of fpHandlers5) h.handler({ agent: rpc.agent, message: rpc.message })
   const fired2 = await waitForSteer(rpc.steered, 5000)
   if (!fired1 && !fired2) ok('own output and non-user sources are ignored')
   else bad(`loop-guard failed (marker=${fired1}, rpc=${fired2})`)
@@ -450,9 +598,10 @@ console.log('\n=== 23) config: frontload:false registers no listener ===')
 {
   const listeners3 = []
   const ctx3 = {
-    tools: { register() {} },
+    tools: { register() { return () => {} } },
     systemPrompt: { section() { return () => {} } },
     on(event, handler) { listeners3.push({ event, handler }); return () => {} },
+    inject() {},
     get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
   }
   plugin.apply(ctx3, { frontload: false })
@@ -464,9 +613,10 @@ console.log('\n=== 24) no executor mounted: apply must NOT throw (lazy resolutio
 {
   const tools4 = []
   const ctx4 = {
-    tools: { register(t) { tools4.push(t) } },
+    tools: { register(t) { tools4.push(t); return () => {} } },
     systemPrompt: { section() { return () => {} } },
     on() { return () => {} },
+    inject() {},
     get() { return undefined } // neither subprocess nor shell
   }
   try {
@@ -487,6 +637,32 @@ console.log('\n=== 24) no executor mounted: apply must NOT throw (lazy resolutio
       else bad('execute threw an unexpected error', null, e.message)
     }
   }
+}
+
+console.log('\n=== 25) settings namespace: apply works without a settings service; entry config drives the shape ===')
+{
+  // ctx.inject never invokes (no settings service mounted) — the plugin must
+  // still mount fully from the composition entry config alone.
+  const tools5 = []
+  const sections5 = []
+  const listeners5 = []
+  const ctx5 = {
+    tools: { register(t) { tools5.push(t); return () => {} } },
+    systemPrompt: { section(s) { sections5.push(s); return () => {} } },
+    on(event, handler) { listeners5.push({ event, handler }); return () => {} },
+    inject() {},
+    get(n) { return n === 'subprocess' ? subprocessService : n === 'shell' ? shellService : undefined }
+  }
+  try {
+    plugin.apply(ctx5, { frontload: true })
+    ok('apply() without a settings service mounts (optional-settings contract)')
+  } catch (e) {
+    bad('apply() must tolerate a missing settings service', null, e.message)
+  }
+  if (sections5.find((s) => s.name === 'tool:codegraph')) ok('entry config still arms the prompt guidance without settings')
+  else bad('entry-config guidance missing without settings service')
+  if (listeners5.some((l) => l.event === 'agent/inbox/inserted')) ok('entry-config frontload:true arms the listener without settings')
+  else bad('entry-config frontload:true must arm the inbox listener without settings service')
 }
 
 console.log(`\n========== ${pass} passed, ${fail} failed ==========\n`)

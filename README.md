@@ -94,11 +94,14 @@ grep / glob / read**：
 也就是说：**装上即生效，无需每个会话单独配置**——其他会话也一样会优先走 codegraph
 来完成代码搜索。
 
-## 结构化 prompt 自动前置注入（frontload）
+## 结构化 prompt 自动前置注入（frontload，默认关闭）
 
 提示词指引仍是「软性」的——模型可能忽略它（上游实测如此）。因此本插件实现了上游
 `UserPromptSubmit` prompt-hook 的 DSH 等价物，也是上游验证过最有效的采用率手段：
 
+- **默认关闭**（`frontload: false`）：注入的 `<codegraph_context>` 以密集原文形式
+  驻留上下文窗口直至会话结束（上游残留上下文实测约 +82% token 残留），因此只在
+  明确需要时开启——可在组合层配置或直接在 DSH 设置界面打开。
 - 插件监听 `agent/inbox/inserted` 事件；当一条**真实用户 prompt** 进入 agent 的
   next-turn 收件箱时，按置信度分级门控：
   - **高置信**：prompt 含结构性关键词（中/英：「调用 / 流程 / 原理 / 重构 / 影响 /
@@ -114,11 +117,27 @@ grep / glob / read**：
   注入内容带标记，不会触发自身循环（steer 落在 next-step 边界，监听器只看 next-turn）。
 - **去重**：同文 prompt 在 10 分钟内重复进入收件箱（GUI 重发排队消息、step 被拒后重新
   入队——每次消息 id 都是新的）只会注入一次，避免重复上下文。
-- 可用配置 `frontload: false` 整体关闭。
 
-## 配置
+## DSH 设置界面可配置（无需重启）
 
-在组合层（如 `cordis.patch.yml` 的 insert 行）可为插件传配置：
+插件把三项配置注册为 **`dsh-codegraph` 用户设置命名空间**（DSH 设置 → 插件 →
+「可配置插件」里的 CodeGraph 卡片），解析层级为 **用户设置 > 组合层配置 > schema 默认值**：
+
+| 设置项 | 默认 | 说明 |
+|---|---|---|
+| `guideSearch` | `true` | 系统提示词里的 codegraph 优先指引 |
+| `frontload` | `false` | 结构化 prompt 自动前置注入 `<codegraph_context>` |
+| `surface` | `core` | 工具面：`core` 4 个 / `full` 13 个 |
+
+设置变更**即时生效**：插件拆掉旧的提示词 section、工具面与 frontload 监听器后按新值
+重挂，不需要重启 DSH。浏览器半（`client/client.js`）负责渲染该设置卡片；宿主半通过
+`ctx.settings.installSection` 注册命名空间（`@deepseek-ai/dsh-settings` 0.1.2-rc.1 起，
+命名空间 id 就是普通的小写连字符字符串，注册入口从独立的 `installSettingsSection` 
+辅助函数改为 `settings` 服务上的方法）。
+
+## 配置（组合层）
+
+在组合层（如 `cordis.patch.yml` 的 insert 行）可为插件传配置（作为用户设置的 base 层）：
 
 ```yaml
 - insert:
@@ -129,7 +148,7 @@ grep / glob / read**：
         guideSearch: true    # 默认 true：注入上述系统提示指引；false 只注册工具
         surface: core        # 默认 core：只注册 status/init/sync/explore 共 4 个工具；
                              # 设为 full 注册全部 13 个
-        frontload: true      # 默认 true：结构化 prompt 自动前置注入；false 关闭
+        frontload: false     # 默认 false：结构化 prompt 自动前置注入；true 开启
 ```
 
 ## 使用流程
@@ -151,21 +170,25 @@ codegraph 的官方 MCP server 在工作区**未建立索引时暴露 0 个工�
 
 ## 测试
 
-`test/run-plugin-test.mjs` 是一个自带真实 `codegraph` CLI + 桩 cordis 服务的运行时测试
-harness：加载本插件的 `lib/index.js`，挂载 `tools`/`subprocess` 服务，`apply()` 后逐一调用
-工具的真实 `execute`。在装好插件的 profile 里运行：
+`test/run-plugin-test.mjs` 是一个自带 codegraph CLI 桩 + 桩 cordis 服务的运行时测试
+harness（keyless，不依赖真实 CLI 进程——DSH 会话沙箱拒绝子进程 spawn）：加载本插件的
+`lib/index.js`，挂载 `tools`/`subprocess`/`shell` 服务桩，`apply()` 后逐一调用工具的
+真实 `execute`。在装好插件的 profile 里或本 checkout 直接运行：
 
 ```bash
+node test/run-plugin-test.mjs            # 本 checkout
 CG_PROFILE_NM=<profile>/node_modules node test/run-plugin-test.mjs
 ```
 
-覆盖：mount 不抛错、**`tool:codegraph` 提示词注入（order 98 < 100，先于 grep/glob/read）**、
-**默认 core surface 只注册 status/init/sync/explore 共 4 个工具**、`surface: 'full'` 下
-13 个工具全部注册并逐一真实执行（`status`→`init`→`query`→`node`→`files` 主流程、
-`sync`/`impact`/`affected`）、**frontload 前置注入**（结构性 prompt 注入 `<codegraph_context>`、
-同文重发去重、非结构性/未索引/自循环/rpc 来源静默跳过、`frontload:false` 不注册监听器）、
-**无执行器服务时 apply 不抛错**（惰性解析，启动顺序安全）、
-显式 `path` 覆盖、以及「无 cwd 且无 path 时报错」的错误路径。
+覆盖：mount 不抛错、**默认 frontload 关闭（无 inbox 监听器）**、**`tool:codegraph` 提示词
+注入（order 98 < 100，先于 grep/glob/read）**、**默认 core surface 只注册
+status/init/sync/explore 共 4 个工具**、`surface: 'full'` 下 13 个工具全部注册并逐一真实
+执行（`status`→`init`→`query`→`node`→`files` 主流程、`sync`/`impact`/`affected`）、
+**frontload 显式开启后的前置注入**（结构性 prompt 注入 `<codegraph_context>`、同文重发
+去重、非结构性/未索引/自循环/rpc 来源静默跳过、`frontload:false` 不注册监听器）、
+**无执行器服务时 apply 不抛错**（惰性解析，启动顺序安全）、**无设置服务时 apply 不抛错**
+（optional-settings 契约，entry 配置独立生效）、显式 `path` 覆盖、以及「无 cwd 且无 path
+时报错」的错误路径。
 
 > 说明：`callers`/`callees` 在本机 `codegraph@1.0.1` 上返回空数组是 **CLI 侧数据/索引特性**
 > （该版本的调用图边未解析到），与插件无关——插件忠实返回 CLI 的真实输出；`impact` 已能
@@ -174,10 +197,11 @@ CG_PROFILE_NM=<profile>/node_modules node test/run-plugin-test.mjs
 ## 仓库结构
 
 ```
-├── package.json        # DSH bundle 声明（dsh.bundle.patch）+ @deepseek-ai/dsh-tools peerDependency
+├── package.json        # DSH bundle 声明（dsh.bundle.patch + dsh.client）+ peerDependencies
 ├── cordis.patch.yml    # 组合层 patch（把本插件的 node half 插入 host 组合）
-├── lib/index.js        # 插件实现：注册 codegraph_* 工具（core 4 个 / full 13 个）
-├── test/               # 运行时测试 harness（真实 CLI + 桩 cordis 服务）
+├── lib/index.js        # 插件实现：注册 codegraph_* 工具（core 4 个 / full 13 个）+ 用户设置命名空间
+├── client/client.js    # 浏览器半：设置页「插件 → 可配置插件」里的 CodeGraph 卡片
+├── test/               # 运行时测试 harness（自带 CLI 桩，keyless 可跑）
 └── plugin-host.js      # （旧）会话级 host-only 动态版，仅作参考
 ```
 

@@ -1,7 +1,7 @@
 {
   "name": "dsh-codegraph",
-  "version": "1.1.0",
-  "description": "CodeGraph for DSH — registers native `codegraph_*` tools (core surface: status/init/sync/explore; full surface adds query/node/files/callers/callees/impact/affected/index/uninit) wrapping the `codegraph` CLI, plus a prompt front-load hook that steers structural CodeGraph context into structural prompts, so the DSH agent can bootstrap, maintain, and query a pre-indexed code knowledge graph without grepping files.",
+  "version": "1.2.0",
+  "description": "CodeGraph for DSH — registers native `codegraph_*` tools (core surface: status/init/sync/explore; full surface adds query/node/files/callers/callees/impact/affected/index/uninit) wrapping the `codegraph` CLI, plus an optional prompt front-load hook (off by default) that steers structural CodeGraph context into structural prompts. guideSearch / surface / frontload are user-settings (dsh-codegraph namespace) editable live from the DSH settings UI (Plugins section), so the DSH agent can bootstrap, maintain, and query a pre-indexed code knowledge graph without grepping files.",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -18,20 +18,32 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./client/client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "client",
     "cordis.patch.yml"
   ],
   "peerDependencies": {
-    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.2.0-0",
+    "@deepseek-ai/dsh-settings": ">=0.1.2-rc.1 <0.2.0-0",
     "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
     "@deepseek-ai/schemastery": ">=3.0.0 <4.0.0"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ],
+      "platform": "web"
     }
   },
   "repository": {

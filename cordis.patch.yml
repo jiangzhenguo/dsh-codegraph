@@ -11,4 +11,4 @@
 # no browser/client half.
 - insert:
     - id: dsh-codegraph
-      name: dsh-codegraph
+      name: '@jiangzhenguo/dsh-codegraph'

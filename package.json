@@ -1,6 +1,6 @@
 {
   "name": "@jiangzhenguo/dsh-codegraph",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "CodeGraph for DSH — registers native `codegraph_*` tools (core surface: status/init/sync/explore; full surface adds query/node/files/callers/callees/impact/affected/index/uninit) wrapping the `codegraph` CLI, plus a prompt front-load hook that steers structural CodeGraph context into structural prompts, so the DSH agent can bootstrap, maintain, and query a pre-indexed code knowledge graph without grepping files.",
   "keywords": [
     "dsh",

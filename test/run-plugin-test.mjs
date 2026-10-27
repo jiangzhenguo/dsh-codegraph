@@ -11,9 +11,9 @@
 // what makes this suite a cross-version gate — see section 0 below.
 import { spawn } from 'node:child_process'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { existsSync, readFileSync, realpathSync, mkdirSync, writeFileSync } from 'node:fs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -23,7 +23,9 @@ const profileNodeModules = process.env.CG_PROFILE_NM
 const pluginRoot = profileNodeModules
   ? join(profileNodeModules, 'dsh-codegraph')
   : join(__dirname, '..') // fall back to the working checkout
-const plugin = await import(join(pluginRoot, 'lib/index.js'))
+// pathToFileURL, not a bare path: on Windows `pluginRoot` is an absolute
+// `D:\…` path and the ESM loader rejects it (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+const plugin = await import(pathToFileURL(join(pluginRoot, 'lib/index.js')).href)
 
 // --- tiny real subprocess executor (minimal child_process wrapper) --------
 function runProc(argv, cwd) {
@@ -46,6 +48,41 @@ function runProc(argv, cwd) {
 // Keyed by resolved script path -> the original command name.
 const shimScripts = new Map()
 
+// Locate an executable the way a POSIX `which` would, cross-platform.
+// On Windows `which` (when present at all) is Git bash's and returns a
+// `/c/...` path that Node cannot even stat, while the real lookup is `where.exe`
+// and the hits are `.CMD` shims Node refuses to spawn without a shell. So:
+// enumerate, and for a shim resolve the JS entry it delegates to.
+function locateCandidates(name) {
+  if (process.platform !== 'win32') {
+    try {
+      return [execFileSync('which', [name]).toString().trim()]
+    } catch {
+      return []
+    }
+  }
+  let found = []
+  try {
+    found = execFileSync('where.exe', [name]).toString().split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+  } catch { /* not on PATH */ }
+  return found
+}
+
+// Extract the JS entry a pnpm/npm `.CMD` shim delegates to, e.g.
+// node "%~dp0\..\global\v11\<hash>\node_modules\@colbymchenry\codegraph\npm-shim.js"
+function winShimScript(cmdPath) {
+  let text
+  try {
+    text = readFileSync(cmdPath, 'utf8')
+  } catch {
+    return undefined
+  }
+  const m = /"([^"]*\.js)"/.exec(text)
+  if (!m) return undefined
+  const abs = resolve(dirname(cmdPath), m[1].replace(/%~dp0\\?/, ''))
+  return existsSync(abs) ? abs : undefined
+}
+
 const subprocessService = {
   async resolveExecutable(name) {
     // Resolve the way the REAL subprocess service does: hand back something
@@ -59,10 +96,7 @@ const subprocessService = {
     // ENOENT — 14 tests failed on an environment quirk that had nothing to do
     // with the plugin. So: locate it, then prove Node can spawn it, and fall
     // back to running the JS entry through the current Node when it cannot.
-    const candidates = []
-    try {
-      candidates.push(execFileSync('which', [name]).toString().trim())
-    } catch { /* not on PATH; try the fallbacks below */ }
+    const candidates = locateCandidates(name)
 
     // Fallback: a global bin directory that is not the running Node's.
     const nodeDir = dirname(process.execPath)
@@ -80,6 +114,15 @@ const subprocessService = {
     // Last resort: resolve the shim's JS file and run it with the current Node.
     // The returned value is a path the plugin execs directly, so recover the
     // script path here and let spawn() prepend the interpreter.
+    for (const candidate of candidates) {
+      if (!candidate || !existsSync(candidate)) continue
+      const script = winShimScript(candidate)
+      if (script !== undefined) {
+        shimScripts.set(script, name)
+        return script
+      }
+    }
+    // POSIX shims are plain files: realpath them and let spawn() add Node.
     try {
       const which = execFileSync('which', [name]).toString().trim()
       const real = realpathSync(which)
@@ -199,6 +242,18 @@ function ensureFixtureProject() {
   }
 }
 ensureFixtureProject()
+
+// A second fixture INSIDE the session cwd, addressed by its bare name. This is
+// the shape that shipped broken in 1.2.2: the name reached spawn() as a cwd and
+// was resolved against the harness process's own cwd, not the session's.
+const REL_PROJECT = 'cg-rel-proj'
+const relProjectDir = join(sessionCwd, REL_PROJECT)
+// A name that must never exist under the session workspace; see section 13d.
+const MISSING_PROJECT = 'cg-no-such-proj-xyz'
+mkdirSync(join(relProjectDir, 'src'), { recursive: true })
+if (!existsSync(join(relProjectDir, 'src/rel.ts'))) {
+  writeFileSync(join(relProjectDir, 'src/rel.ts'), 'export function relFn(x: number): number {\n  return x + 1\n}\n')
+}
 
 function makeExec() {
   const aborted = { value: false }
@@ -545,6 +600,75 @@ try {
   bad('codegraph_status with explicit path', null, e.message)
 }
 
+console.log('\n=== 13b) RELATIVE path arg resolves against the session workspace ===')
+// The caller only knows the session cwd, so `path: '<rel>'` must mean
+// "<session cwd>/<rel>". It must NOT be handed to spawn() as a cwd: spawn
+// resolves that against the HOST process's cwd (not the session's), and when
+// the directory is missing there the failure surfaces as
+// `spawn <codegraph> ENOENT` — which reads exactly like a missing binary.
+// This is the regression that shipped as 1.2.2.
+try {
+  // The fixture nests inside the session project, and the CLI bubbles `status`
+  // up to the nearest indexed ancestor, so it needs its own index before it can
+  // report itself. Indexing it through a RELATIVE path exercises the same fix
+  // on the init path.
+  const initOut = String(await call('codegraph_init', { path: REL_PROJECT }))
+  console.log('   init(rel):', initOut.slice(0, 160))
+  const s = String(await call('codegraph_status', { path: REL_PROJECT }))
+  const parsed = JSON.parse(s)
+  // Compare RESOLVED paths: the CLI echoes a native (backslash) path on
+  // Windows while the fixture is built from POSIX-style pieces.
+  if (resolve(parsed.projectPath) === resolve(relProjectDir)) {
+    ok('relative path resolved to sessionCwd/<rel>', parsed.projectPath)
+  } else {
+    bad('relative path did not resolve against the session cwd', `expected ${resolve(relProjectDir)}, got ${parsed.projectPath}`)
+  }
+  if (isAbsolute(parsed.projectPath)) ok('reported projectPath is absolute')
+  else bad('reported projectPath must be absolute', parsed.projectPath)
+} catch (e) {
+  bad('codegraph_status with RELATIVE path', null, e.message)
+}
+
+console.log('\n=== 13c) relative path with NO session cwd (guarded resolve, no TypeError) ===')
+// `resolve(undefined, p)` throws a TypeError, so the guarded branch in
+// lib/index.js must fall back to resolving against the host cwd. That path is
+// supported today — do not regress it into a crash. Address the harness's own
+// cwd so the fallback is observable and the directory exists there.
+try {
+  const t = registeredTools.find((x) => x.name === 'codegraph_status')
+  const s = String(await t.execute({ path: '.' }, {
+    agent: { session: { header: {} } },
+    signal: new AbortController().signal
+  }))
+  const parsed = JSON.parse(s)
+  if (isAbsolute(parsed.projectPath) && resolve(parsed.projectPath) === resolve('.')) {
+    ok('no session cwd → relative path resolves against the host cwd', parsed.projectPath)
+  } else {
+    bad('relative path without session cwd resolved unexpectedly', `got ${parsed.projectPath}`)
+  }
+} catch (e) {
+  bad('relative path without session cwd must still work', null, e.message)
+}
+
+console.log('\n=== 13d) a MISSING path errors with the path, not a phantom ENOENT binary ===')
+// Resolving the path fixes the silent misdirection only for directories that
+// exist. A typo'd name still reaches spawn() as a `cwd`, and Node reports that
+// as `spawn <codegraph> ENOENT` — blaming the binary for a directory problem.
+// The plugin must name the offending path itself.
+try {
+  await call('codegraph_status', { path: MISSING_PROJECT })
+  bad('missing path must be rejected before spawning', 'call resolved without an error')
+} catch (e) {
+  const msg = String(e.message || e)
+  if (/ENOENT.*spawn|spawn .*ENOENT/.test(msg) === false && msg.includes('does not exist')) {
+    ok('missing path reported as a path problem', msg.slice(0, 120))
+  } else {
+    bad('missing path should name the directory, not the binary', msg)
+  }
+  if (msg.includes(MISSING_PROJECT)) ok('error message names the offending relative path')
+  else bad('error message must quote the path that failed', msg)
+}
+
 console.log('\n=== 14) codegraph_sync ===')
 try {
   const s = String(await call('codegraph_sync', {}))
@@ -639,10 +763,14 @@ console.log('\n=== 19) frontload: structural zh prompt on indexed project → st
     if (steered[0].role === 'user' && steered[0].id) ok('steered message is a valid user message (id + role)')
     else bad('steered message malformed')
     // 0.2.0 shape: UserMessage is frozen and carries a merge-extensible source
-    // tag. The front-load listener gates on `source.kind`, so a message that
-    // lost its source would silently stop front-loading.
-    if (steered[0].source && steered[0].source.kind === 'user') ok('steered message carries source.kind === "user" (0.2.0 MessageSourceMap shape)')
-    else bad('steered message must carry a user source tag', JSON.stringify(steered[0].source))
+    // tag. LOAD-BEARING: the kind must NOT be 'user' — the Chat UI prints a
+    // kind:'user' message in full as a human bubble, which would paste the
+    // whole explore dump into the transcript. Every DSH-native injection uses
+    // `plugin:<name>`, so this one collapses into an injected-context row.
+    if (steered[0].source && steered[0].source.kind === 'plugin:dsh-codegraph') ok('steered message is tagged plugin:dsh-codegraph (0.2.0 MessageSourceMap shape)')
+    else bad('steered message must carry the plugin source kind', JSON.stringify(steered[0].source))
+    if (steered[0].source && steered[0].source.kind !== 'user') ok('injected context does not claim source.kind === "user" (renders as collapsed row, not a bubble)')
+    else bad('injected context must not be tagged as a user message', JSON.stringify(steered[0].source))
     if (Object.isFrozen(steered[0])) ok('steered message is frozen (0.2.0 createUserMessage freezes before publication)')
     else bad('steered message should be frozen by createUserMessage')
     if (Array.isArray(steered[0].content) && steered[0].content.length > 0) ok('steered message content is a ContentBlock[] array')
